@@ -1,0 +1,13 @@
+name: webchat
+kind: platform
+version: 1.0.0
+description: >
+  Web Chat platform adapter for Hermes Agent.
+  Provides a self-hosted web-based chat interface with JWT authentication,
+  full markdown rendering (including LaTeX math), and streaming responses.
+  Serves its own React SPA and proxies messages to/from the Hermes gateway.
+author: Hermes Agent
+requires_env:
+  - WEBCHAT_USERNAME
+  - WEBCHAT_PASSWORD
+  - WEBCHAT_JWT_SECRET
