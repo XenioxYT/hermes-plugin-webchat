@@ -92,6 +92,69 @@ _UPLOAD_ROOT = os.path.join(
     "webchat_uploads",
 )
 
+
+class _WebchatStreamState:
+    """Server-side state for one in-flight assistant response."""
+
+    def __init__(self, session_id: str) -> None:
+        self.session_id = session_id
+        self.events: list[Dict[str, Any]] = []
+        self.subscribers: set[asyncio.Queue] = set()
+        self.done = asyncio.Event()
+        self.persisted = False
+        self.final_content = ""
+        self.final_message_id = ""
+        self.final_interactions: list[Dict[str, Any]] = []
+        self.final_thinking = ""
+        self.final_blocks: list[Dict[str, Any]] = []
+        self.pending_media: list[Dict[str, Any]] = []
+        self.error: Optional[str] = None
+
+    def subscribe(self) -> asyncio.Queue:
+        queue: asyncio.Queue = asyncio.Queue()
+        self.subscribers.add(queue)
+        return queue
+
+    def unsubscribe(self, queue: asyncio.Queue) -> None:
+        self.subscribers.discard(queue)
+
+    async def publish(self, event: Dict[str, Any]) -> None:
+        self.events.append(event)
+        self._accumulate(event)
+        for queue in list(self.subscribers):
+            await queue.put(event)
+        if event.get("type") == "done":
+            self.done.set()
+
+    def _accumulate(self, event: Dict[str, Any]) -> None:
+        item_type = event.get("type")
+        item_content = event.get("content") or ""
+        if event.get("message_id"):
+            self.final_message_id = event.get("message_id") or self.final_message_id
+        if item_type == "replace":
+            self.final_content = item_content
+        elif item_type == "response":
+            self.final_content += item_content
+        elif item_type == "media":
+            self.pending_media.append({
+                "path": event.get("path", ""),
+                "title": event.get("title", ""),
+                "caption": event.get("caption", ""),
+                "duration": event.get("duration"),
+            })
+        elif item_type in ("thinking", "reasoning"):
+            self.final_thinking += item_content
+            if self.final_blocks and self.final_blocks[-1].get("type") == "text":
+                self.final_blocks[-1]["content"] += item_content
+            else:
+                self.final_blocks.append({"type": "text", "content": item_content})
+        elif item_type == "interaction" and event.get("interaction"):
+            self.final_content = self.final_content or item_content
+            interaction = event["interaction"]
+            self.final_interactions.append(interaction)
+            if interaction.get("kind") == "tool_call":
+                self.final_blocks.append({"type": "tool_call", "interaction": interaction})
+
 # ---------------------------------------------------------------------------
 # Database helpers
 # ---------------------------------------------------------------------------
@@ -831,6 +894,10 @@ class WebchatAdapter(BasePlatformAdapter):
     # as separate native attachments.  The webchat frontend's parseMediaMarkers()
     # renders them at their original positions in the text flow.
     KEEP_MEDIA_INLINE = True
+    # Tells the stream consumer NOT to strip <think>...</think> blocks from
+    # streaming content so the adapter can parse them into separate reasoning
+    # SSE events for the webchat frontend's ThinkingDisclosure.
+    PRESERVE_REASONING = True
     
     def __init__(self, config: PlatformConfig):
         """Initialise the webchat adapter.
@@ -864,13 +931,10 @@ class WebchatAdapter(BasePlatformAdapter):
         self._runner: Optional[web.AppRunner] = None
         self._site: Optional[web.TCPSite] = None
         
-        # Response queues: maps session_id → asyncio.Queue
-        # These bridge the gap between:
-        #   - handle_message()  (dispatches the message to the gateway)
-        #   - send()            (called by gateway when agent responds)
-        # The HTTP endpoint creates a queue, stores it here, then
-        # reads from it to stream the response back to the client.
-        self._pending_responses: Dict[str, asyncio.Queue] = {}
+        # In-flight streams live independently of any browser tab.  SSE
+        # handlers subscribe to these states; the gateway task continues to
+        # publish and persist even if every subscriber disconnects.
+        self._active_streams: Dict[str, _WebchatStreamState] = {}
         self._pending_interactions: Dict[str, Dict[str, Any]] = {}
     
     # ── Lifecycle ───────────────────────────────────────────────────────
@@ -919,6 +983,26 @@ class WebchatAdapter(BasePlatformAdapter):
     
     # ── Message handling ─────────────────────────────────────────────────
     
+    _THINK_RE = re.compile(
+        r'<(REASONING_SCRATCHPAD|think|reasoning|THINKING|thinking|thought)>'
+        r'(.*?)</\1>',
+        re.DOTALL,
+    )
+    
+    def _extract_reasoning(self, content: str) -> tuple[str, str]:
+        """Extract <think>...</think> reasoning blocks from content.
+        
+        Returns (display_text, thinking_text) where display_text has think
+        blocks stripped and thinking_text is the concatenated reasoning.
+        """
+        thinking_parts = []
+        def _replace_think(match):
+            thinking_parts.append(match.group(2).strip())
+            return ""
+        display = self._THINK_RE.sub(_replace_think, content).strip()
+        display = re.sub(r'\n{3,}', '\n\n', display).strip()
+        return display, "\n".join(thinking_parts)
+    
     async def send(
         self,
         chat_id: str,
@@ -945,20 +1029,32 @@ class WebchatAdapter(BasePlatformAdapter):
         # MEDIA:/path markers pass through inline so the frontend's
         # parseMediaMarkers() can render attachments at their original
         # position in the text flow — no stripping needed here.
-        # Look up the response queue for this session
-        queue = self._pending_responses.get(chat_id)
-        if queue is None:
-            logger.warning("Webchat: No pending response queue for session %s", chat_id)
+        state = self._active_streams.get(chat_id)
+        if state is None:
+            logger.warning("Webchat: No active stream for session %s", chat_id)
             return SendResult(success=False, message_id="")
         
         # Push the response content as an SSE event.  The HTTP handler owns the
         # stream lifecycle now, so adapter.send() must not close the queue; the
         # gateway may call send() followed by edit_message() for token streaming.
         message_id = str(uuid.uuid4())
+        # Extract reasoning blocks from send() content too — commentary and
+        # first-send text may contain think blocks when PRESERVE_REASONING
+        # is enabled.
+        display_content, thinking_text = self._extract_reasoning(content)
+        if thinking_text:
+            try:
+                await state.publish({
+                    "type": "reasoning",
+                    "content": thinking_text,
+                    "session_id": chat_id,
+                })
+            except Exception:
+                pass
         try:
-            await queue.put({
+            await state.publish({
                 "type": "response",
-                "content": content,
+                "content": display_content,
                 "session_id": chat_id,
                 "message_id": message_id,
             })
@@ -984,15 +1080,31 @@ class WebchatAdapter(BasePlatformAdapter):
         to a "replace the current streamed assistant message" SSE event.
         """
         # MEDIA:/path markers pass through inline — same rationale as send().
-        queue = self._pending_responses.get(chat_id)
-        if queue is None:
-            logger.warning("Webchat: No pending response queue for edit in session %s", chat_id)
+        state = self._active_streams.get(chat_id)
+        if state is None:
+            logger.warning("Webchat: No active stream for edit in session %s", chat_id)
             return SendResult(success=False, message_id=message_id, error="No pending response")
         
+        # Extract <think>...</think> reasoning blocks from content and push
+        # them as separate "reasoning" SSE events so the frontend can render
+        # them in the ThinkingDisclosure rather than in the main text.
+        # The stream consumer retains these blocks when PRESERVE_REASONING is
+        # True (set by WebchatAdapter).
+        display_content, thinking_text = self._extract_reasoning(content)
+        if thinking_text:
+            try:
+                await state.publish({
+                    "type": "reasoning",
+                    "content": thinking_text,
+                    "session_id": chat_id,
+                })
+            except Exception:
+                pass
+        
         try:
-            await queue.put({
+            await state.publish({
                 "type": "replace",
-                "content": content,
+                "content": display_content,
                 "session_id": chat_id,
                 "message_id": message_id,
                 "final": finalize,
@@ -1048,10 +1160,10 @@ class WebchatAdapter(BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         """Deliver a voice/audio file by pushing a structured 'media' SSE event."""
-        queue = self._pending_responses.get(chat_id)
-        if queue:
+        state = self._active_streams.get(chat_id)
+        if state:
             try:
-                await queue.put({
+                await state.publish({
                     "type": "media",
                     "path": audio_path,
                     "title": os.path.basename(audio_path),
@@ -1071,10 +1183,10 @@ class WebchatAdapter(BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         """Deliver a video file by pushing a structured 'media' SSE event."""
-        queue = self._pending_responses.get(chat_id)
-        if queue:
+        state = self._active_streams.get(chat_id)
+        if state:
             try:
-                await queue.put({
+                await state.publish({
                     "type": "media",
                     "path": video_path,
                     "title": os.path.basename(video_path),
@@ -1096,10 +1208,10 @@ class WebchatAdapter(BasePlatformAdapter):
         Pushes a 'typing' event to the SSE stream so the UI can show
         "Hermes is thinking..." while the agent processes the request.
         """
-        queue = self._pending_responses.get(chat_id)
-        if queue:
+        state = self._active_streams.get(chat_id)
+        if state:
             try:
-                await queue.put({"type": "typing"})
+                await state.publish({"type": "typing", "session_id": chat_id})
             except Exception:
                 pass
 
@@ -1115,10 +1227,10 @@ class WebchatAdapter(BasePlatformAdapter):
         chunk.  Pushes a ``reasoning`` SSE event that the frontend accumulates
         into its collapsible "Thinking..." disclosure block.
         """
-        queue = self._pending_responses.get(chat_id)
-        if queue:
+        state = self._active_streams.get(chat_id)
+        if state:
             try:
-                await queue.put({
+                await state.publish({
                     "type": "reasoning",
                     "content": content,
                     "session_id": chat_id,
@@ -1143,12 +1255,12 @@ class WebchatAdapter(BasePlatformAdapter):
         _diag_path = "/tmp/hermes_tool_diag.txt"
         with open(_diag_path, "a") as f:
             f.write(f"[{__import__('datetime').datetime.now()}] send_tool_call ENTERED chat_id={chat_id} tool={tool}\n")
-        # Check if queue exists
-        _q = self._pending_responses.get(chat_id)
+        # Check if a live stream exists
+        _q = self._active_streams.get(chat_id)
         with open(_diag_path, "a") as f:
             f.write(f"[{__import__('datetime').datetime.now()}] send_tool_call queue={'EXISTS' if _q else 'NONE'}\n")
             if _q:
-                f.write(f"[{__import__('datetime').datetime.now()}] send_tool_call queue_size_approx={_q.qsize() if hasattr(_q, 'qsize') else 'N/A'}\n")
+                f.write(f"[{__import__('datetime').datetime.now()}] send_tool_call events={len(_q.events)} subscribers={len(_q.subscribers)}\n")
         args_preview = json.dumps(args, ensure_ascii=False, default=str)
         if len(args_preview) > 200:
             args_preview = args_preview[:197] + "..."
@@ -1172,12 +1284,128 @@ class WebchatAdapter(BasePlatformAdapter):
         return {"name": f"Web Chat ({chat_id[:8]}...)", "type": "dm"}
 
     async def _queue_event(self, chat_id: str, event: Dict[str, Any]) -> bool:
-        """Push an event into an active webchat SSE stream."""
-        queue = self._pending_responses.get(chat_id)
-        if not queue:
+        """Push an event into an active webchat stream."""
+        state = self._active_streams.get(chat_id)
+        if not state:
             return False
-        await queue.put(event)
+        event.setdefault("session_id", chat_id)
+        await state.publish(event)
         return True
+
+    async def _stream_state_to_response(
+        self,
+        request: web.Request,
+        state: _WebchatStreamState,
+    ) -> web.StreamResponse:
+        """Attach one HTTP/SSE response to an in-flight stream state."""
+        resp = web.StreamResponse(
+            status=200,
+            headers={
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "Access-Control-Allow-Origin": "*",
+                "X-Accel-Buffering": "no",
+            },
+        )
+        await resp.prepare(request)
+
+        queue = state.subscribe()
+        try:
+            for event in list(state.events):
+                await resp.write(f"data: {json.dumps(event)}\n\n".encode())
+                await resp.drain()
+
+            while not state.done.is_set():
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    await resp.write(b": keep-alive\n\n")
+                    await resp.drain()
+                    continue
+
+                await resp.write(f"data: {json.dumps(event)}\n\n".encode())
+                await resp.drain()
+
+            # Flush events published while replay was being written, including
+            # the final done event if it won the race with the live loop.
+            while not queue.empty():
+                event = queue.get_nowait()
+                await resp.write(f"data: {json.dumps(event)}\n\n".encode())
+                await resp.drain()
+        except (ConnectionError, asyncio.CancelledError):
+            pass
+        except Exception as e:
+            logger.debug("Webchat: SSE subscriber disconnected: %s", e)
+        finally:
+            state.unsubscribe(queue)
+
+        return resp
+
+    async def _finalize_stream_state(
+        self,
+        session_id: str,
+        state: _WebchatStreamState,
+        handler_task: Optional[asyncio.Task],
+    ) -> None:
+        """Persist the final assistant response after the gateway task exits."""
+        try:
+            if handler_task is not None:
+                try:
+                    await handler_task
+                except asyncio.CancelledError:
+                    state.error = "Response was cancelled"
+                except Exception as e:
+                    state.error = str(e)
+                    logger.error("Webchat: Gateway handler failed: %s", e)
+
+            if state.error:
+                await state.publish({
+                    "type": "error",
+                    "content": state.error,
+                    "session_id": session_id,
+                })
+
+            final_content = state.final_content
+            if state.pending_media:
+                media_suffix = "\n".join(
+                    f"MEDIA:{m['path']}" for m in state.pending_media if m.get("path")
+                )
+                if media_suffix:
+                    final_content = (final_content + "\n" + media_suffix).strip()
+
+            final_content = re.sub(
+                r'(?m)^MEDIA:\s*(?:<[^>\n]*>|\$\{[^}]*)[^\n]*\n?',
+                '',
+                final_content,
+            ).strip()
+
+            final_message_id = state.final_message_id
+            if final_content.strip() or state.final_interactions or state.final_thinking.strip():
+                final_message_id = _db_add_message(
+                    session_id,
+                    "assistant",
+                    final_content,
+                    interactions=state.final_interactions,
+                    thinking=state.final_thinking,
+                    blocks=state.final_blocks,
+                    message_id=final_message_id or None,
+                )
+                state.final_message_id = final_message_id
+
+            state.persisted = True
+            if not state.done.is_set():
+                await state.publish({
+                    "type": "done",
+                    "session_id": session_id,
+                    "message_id": final_message_id,
+                })
+        finally:
+            # Keep completed state briefly so an already-connected subscriber
+            # can receive "done"; durable history is available from SQLite.
+            await asyncio.sleep(30)
+            if self._active_streams.get(session_id) is state:
+                self._active_streams.pop(session_id, None)
 
     @staticmethod
     def _strip_media_tags(text: str) -> str:
@@ -1431,6 +1659,7 @@ class WebchatAdapter(BasePlatformAdapter):
         
         # Authenticated API endpoints
         self._app.router.add_post("/api/send", self._handle_send)
+        self._app.router.add_post("/api/command", self._handle_command)
         self._app.router.add_get("/api/capabilities", self._handle_capabilities)
         self._app.router.add_get("/api/model", self._handle_get_model)
         self._app.router.add_post("/api/model", self._handle_set_model)
@@ -1445,6 +1674,9 @@ class WebchatAdapter(BasePlatformAdapter):
         self._app.router.add_get("/api/sessions/slug/{slug}", self._handle_session_by_slug)
         self._app.router.add_get(
             "/api/sessions/{session_id}/messages", self._handle_get_messages
+        )
+        self._app.router.add_get(
+            "/api/sessions/{session_id}/stream", self._handle_session_stream
         )
         self._app.router.add_delete(
             "/api/sessions/{session_id}", self._handle_delete_session
@@ -1606,13 +1838,22 @@ class WebchatAdapter(BasePlatformAdapter):
         if not message_text and not media_paths:
             return self._json_response({"error": "Message or file is required"}, status=400)
         
+        active_state = self._active_streams.get(session_id)
+        if active_state is not None and active_state.done.is_set() and active_state.persisted:
+            self._active_streams.pop(session_id, None)
+            active_state = None
+        if active_state is not None:
+            return self._json_response(
+                {"error": "A response is already running for this conversation"},
+                status=409,
+            )
+
         # Register the session in the database if new
         _db_add_session(session_id)
         _db_add_message(session_id, "user", message_text, attachments)
-        
-        # Create a response queue and store it for the send() callback
-        queue: asyncio.Queue = asyncio.Queue()
-        self._pending_responses[session_id] = queue
+
+        state = _WebchatStreamState(session_id)
+        self._active_streams[session_id] = state
         
         try:
             # Build a MessageEvent as required by the Hermes gateway
@@ -1652,154 +1893,64 @@ class WebchatAdapter(BasePlatformAdapter):
             await self.handle_message(event)
             handler_task = self._session_tasks.get(session_key)
             
-            # Prepare an SSE streaming response
-            resp = web.StreamResponse(
-                status=200,
-                headers={
-                    "Content-Type": "text/event-stream",
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                    "Access-Control-Allow-Origin": "*",
-                    "X-Accel-Buffering": "no",  # Disable nginx buffering
-                },
+            asyncio.create_task(
+                self._finalize_stream_state(session_id, state, handler_task)
             )
-            await resp.prepare(request)
-            final_assistant_content = ""
-            final_assistant_message_id = ""
-            final_assistant_interactions: list[Dict[str, Any]] = []
-            final_assistant_thinking = ""
-            final_assistant_blocks: list = []
-            # Reset pending media at the start of each SSE handler to
-            # prevent stale items from previous turns leaking into
-            # the current message's content.
-            self._pending_media = []
-            
-            # Read from the response queue and write SSE events.  The queue gets
-            # items from self.send()/self.edit_message(); completion is detected
-            # from the gateway handler task so token streaming can deliver many
-            # replace events before the HTTP stream closes.
-            while True:
-                try:
-                    item = await asyncio.wait_for(queue.get(), timeout=1.0)
-                except asyncio.TimeoutError:
-                    if handler_task is not None and handler_task.done():
-                        break
-                    # Keep proxies and browsers from treating the stream as idle.
-                    await resp.write(b": keep-alive\n\n")
-                    await resp.drain()
-                    continue
-                
-                if item is None:
-                    break  # Compatibility with older send() behavior
-                
-                # Write the SSE event
-                await resp.write(f"data: {json.dumps(item)}\n\n".encode())
-                await resp.drain()
-                if isinstance(item, dict):
-                    item_type = item.get("type")
-                    item_content = item.get("content") or ""
-                    if item.get("message_id"):
-                        final_assistant_message_id = item.get("message_id") or final_assistant_message_id
-                    if item_type == "replace":
-                        final_assistant_content = item_content
-                    elif item_type == "response":
-                        final_assistant_content += item_content
-                    elif item_type == "media":
-                        # Accumulate media items for the final message.  These are
-                        # structured file references from send_document(),
-                        # send_image_file(), etc. — not emoji-prefixed text.
-                        if not hasattr(self, "_pending_media"):
-                            self._pending_media = []
-                        self._pending_media.append({
-                            "path": item.get("path", ""),
-                            "title": item.get("title", ""),
-                            "caption": item.get("caption", ""),
-                            "duration": item.get("duration"),
-                        })
-                    elif item_type in ("thinking", "reasoning"):
-                        final_assistant_thinking += item_content
-                        # Build chronological blocks
-                        if final_assistant_blocks and final_assistant_blocks[-1].get("type") == "text":
-                            final_assistant_blocks[-1]["content"] += item_content
-                        else:
-                            final_assistant_blocks.append({"type": "text", "content": item_content})
-                    elif item_type == "interaction" and item.get("interaction"):
-                        final_assistant_content = final_assistant_content or item_content
-                        interaction = item["interaction"]
-                        final_assistant_interactions.append(interaction)
-                        if interaction.get("kind") == "tool_call":
-                            final_assistant_blocks.append({"type": "tool_call", "interaction": interaction})
-                
-                if handler_task is not None and handler_task.done() and queue.empty():
-                    break
-            
-            if handler_task is not None and handler_task.done():
-                try:
-                    exc = handler_task.exception()
-                except asyncio.CancelledError:
-                    exc = None
-                if exc:
-                    logger.error("Webchat: Gateway handler failed: %s", exc)
-                    await resp.write(
-                        f"data: {json.dumps({'type': 'error', 'content': str(exc)})}\n\n".encode()
-                    )
-            elif handler_task is not None:
-                handler_task.cancel()
-            
-            if final_assistant_content.strip() or final_assistant_interactions:
-                # Embed any pending media items as MEDIA: markers at the end of the
-                # content so they persist across page reloads.  The frontend's
-                # parseMediaMarkers() extracts these; extractThinking() strips them
-                # from display text.  This avoids leaking emoji garbage (📎, 🖼️, 🎬)
-                # into the content while keeping media references durable.
-                _pending_media = getattr(self, "_pending_media", []) or []
-                if _pending_media:
-                    media_suffix = "\n".join(
-                        f"MEDIA:{m['path']}" for m in _pending_media
-                    )
-                    final_assistant_content = (
-                        final_assistant_content + "\n" + media_suffix
-                    ).strip()
-                    # Clear pending media so they don't carry over to the next turn.
-                    self._pending_media = []
-                # Strip MEDIA: markers that leaked from reasoning/thinking text.
-                # The agent's internal reasoning may contain MEDIA: references
-                # (template fragments, filenames from prior turns, etc.) that
-                # end up in the stored content after the thinking block is
-                # extracted.  These must be removed so they don't render as
-                # spurious attachment pills at the bottom of the message.
-                #
-                # Only strips patterns that are CLEARLY from reasoning, never
-                # legitimate file paths.  The main source of leaked file-path
-                # markers (MEDIA:/tmp/foo.txt) is _pending_media carryover,
-                # which is handled by clearing _pending_media above.
-                final_assistant_content = re.sub(
-                    r'(?m)^MEDIA:\s*(?:<[^>\n]*>|\$\{[^}]*)[^\n]*\n?',
-                    '',
-                    final_assistant_content,
-                ).strip()
-                final_assistant_message_id = _db_add_message(
-                    session_id,
-                    "assistant",
-                    final_assistant_content,
-                    interactions=final_assistant_interactions,
-                    thinking=final_assistant_thinking,
-                    blocks=final_assistant_blocks,
-                    message_id=final_assistant_message_id or None,
-                )
-
-            await resp.write(
-                f"data: {json.dumps({'type': 'done', 'session_id': session_id, 'message_id': final_assistant_message_id})}\n\n".encode()
-            )
-            
-            return resp
+            return await self._stream_state_to_response(request, state)
         
         except Exception as e:
             logger.error("Webchat: Error handling send request: %s", e)
+            if self._active_streams.get(session_id) is state:
+                self._active_streams.pop(session_id, None)
             return self._json_response({"error": str(e)}, status=500)
-        finally:
-            # Clean up the response queue regardless of outcome
-            self._pending_responses.pop(session_id, None)
+
+    async def _handle_command(self, request: web.Request) -> web.Response:
+        """POST /api/command — send a command into an active webchat run."""
+        payload = self._require_auth(request)
+        if not payload:
+            return self._json_response({"error": "Unauthorised"}, status=401)
+
+        try:
+            data = await request.json()
+        except json.JSONDecodeError:
+            return self._json_response({"error": "Invalid JSON"}, status=400)
+
+        session_id = str(data.get("session_id") or "").strip()
+        message_text = str(data.get("message") or "").strip()
+        if not session_id or not message_text:
+            return self._json_response(
+                {"error": "session_id and message are required"},
+                status=400,
+            )
+
+        state = self._active_streams.get(session_id)
+        if state is None or (state.done.is_set() and state.persisted):
+            return self._json_response(
+                {"error": "No active response for this conversation"},
+                status=409,
+            )
+
+        if message_text.startswith("/steer "):
+            steer_text = message_text[len("/steer "):].strip()
+            if steer_text:
+                _db_add_message(session_id, "user", steer_text)
+
+        source = self.build_source(
+            chat_id=session_id,
+            chat_name="Web Chat",
+            chat_type="dm",
+            user_id=payload.get("user_id", "unknown"),
+            user_name=payload.get("username", "unknown"),
+        )
+        event = MessageEvent(
+            text=message_text,
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id=str(uuid.uuid4()),
+        )
+
+        await self.handle_message(event)
+        return self._json_response({"status": "ok"})
     
     async def _handle_capabilities(self, request: web.Request) -> web.Response:
         """GET /api/capabilities — describe webchat feature support."""
@@ -2409,6 +2560,24 @@ class WebchatAdapter(BasePlatformAdapter):
             return self._json_response({"messages": _db_get_messages(session_id)})
         except Exception as e:
             return self._json_response({"error": str(e)}, status=500)
+
+    async def _handle_session_stream(self, request: web.Request) -> web.StreamResponse:
+        """GET /api/sessions/{session_id}/stream — attach to a live response."""
+        payload = self._require_auth(request)
+        if not payload:
+            return self._json_response({"error": "Unauthorised"}, status=401)
+
+        session_id = request.match_info.get("session_id", "")
+        if not session_id:
+            return self._json_response({"error": "Session ID required"}, status=400)
+
+        state = self._active_streams.get(session_id)
+        if state is None:
+            return web.Response(status=204, headers={"Access-Control-Allow-Origin": "*"})
+        if state.done.is_set() and state.persisted:
+            return web.Response(status=204, headers={"Access-Control-Allow-Origin": "*"})
+
+        return await self._stream_state_to_response(request, state)
     
     async def _handle_delete_session(
         self, request: web.Request
@@ -2728,9 +2897,24 @@ def register(ctx):
         # LLM guidance injected into system prompt
         platform_hint=(
             "You are chatting via a Web Chat interface. "
-            "This platform supports full markdown including tables, math (LaTeX), "
-            "syntax-highlighted code blocks, and interactive elements. "
-            "You can use all standard markdown formatting freely. "
-            "The web interface renders your responses with high fidelity."
+            "This platform supports GitHub Flavored Markdown including tables, "
+            "task lists, strikethrough, links, images, syntax-highlighted code "
+            "blocks, inline LaTeX with $...$, and block LaTeX with $$...$$. "
+            "For flowcharts and diagrams, use Mermaid fenced code blocks with "
+            "```mermaid, ```flowchart, or ```diagram; these render natively in "
+            "the web UI. For interactive artifacts, use explicit artifact fences "
+            "only: ```artifact-react for React/TSX, ```artifact-html for HTML, "
+            "or ```artifact for a React artifact. Do not use plain ```tsx, "
+            "```jsx, ```react, or ```html when you intend an artifact; those are "
+            "shown as normal code. React artifacts run in a sandbox with preview, "
+            "source, fullscreen, copy, and sidebar controls. They include a small "
+            "shadcn-style component kit; you may import components from "
+            "@/components/ui/button, @/components/ui/card, @/components/ui/badge, "
+            "@/components/ui/input, @/components/ui/textarea, or @/components/ui/tabs, "
+            "or access them via the Shadcn global. Recharts, d3, React hooks, and "
+            "basic lucide-react icon imports are also available. Prefer Mermaid "
+            "for static diagrams and artifacts only for interactive UI, charts, "
+            "or demos. Raw inline HTML in normal markdown is not rendered; place "
+            "HTML in an artifact-html fence when needed."
         ),
     )
