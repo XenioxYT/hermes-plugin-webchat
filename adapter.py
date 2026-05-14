@@ -36,6 +36,7 @@ import random
 import re
 import sqlite3
 import string
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -69,6 +70,15 @@ logger = logging.getLogger(__name__)
 def _generate_slug() -> str:
     """Generate a short random URL slug (6 alphanumeric chars)."""
     return "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
+
+
+def _extract_hostname(url: str) -> str:
+    """Extract hostname from a URL, falling back to empty string."""
+    try:
+        from urllib.parse import urlparse
+        return urlparse(url).netloc or ""
+    except Exception:
+        return ""
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -107,6 +117,7 @@ class _WebchatStreamState:
         self.final_interactions: list[Dict[str, Any]] = []
         self.final_thinking = ""
         self.final_blocks: list[Dict[str, Any]] = []
+        self.final_sources: list[Dict[str, Any]] = []
         self.pending_media: list[Dict[str, Any]] = []
         self.error: Optional[str] = None
 
@@ -154,6 +165,8 @@ class _WebchatStreamState:
             self.final_interactions.append(interaction)
             if interaction.get("kind") == "tool_call":
                 self.final_blocks.append({"type": "tool_call", "interaction": interaction})
+        elif item_type == "sources_update":
+            self.final_sources = event.get("sources") or []
 
 # ---------------------------------------------------------------------------
 # Database helpers
@@ -217,6 +230,10 @@ def _init_db() -> None:
         if "blocks" not in columns:
             conn.execute(
                 "ALTER TABLE messages ADD COLUMN blocks TEXT NOT NULL DEFAULT '[]'"
+            )
+        if "sources" not in columns:
+            conn.execute(
+                "ALTER TABLE messages ADD COLUMN sources TEXT NOT NULL DEFAULT '[]'"
             )
 
         # Add pinned/archived columns to sessions (if migrating from old schema)
@@ -339,12 +356,97 @@ def _db_update_session(session_id: str, title: Optional[str] = None) -> None:
         conn.close()
 
 
-def _derive_title(text: str) -> str:
-    """Derive a compact conversation title from the first user message."""
+def _derive_title(text: str, max_len: int = 90) -> str:
+    """Derive a compact conversation title from the first user message.
+
+    Truncates at a sentence or word boundary for clean display.
+    """
     clean = " ".join((text or "").strip().split())
     if not clean:
         return "File upload"
-    return clean[:60] + ("..." if len(clean) > 60 else "")
+    if len(clean) <= max_len:
+        return clean
+    # Try to cut at sentence boundary within the window
+    window = clean[:max_len]
+    for sep in (". ", "! ", "? ", "; "):
+        idx = window.rfind(sep)
+        if idx > max_len // 3:
+            return window[:idx + 1]
+    # Fall back to word boundary
+    idx = window.rfind(" ")
+    if idx > max_len // 3:
+        return window[:idx] + "..."
+    return window + "..."
+
+
+def _lookup_hermes_session_names_batch(chat_session_ids: list) -> Dict[str, str]:
+    """Batch-resolve AI-generated session titles from Hermes state.db.
+
+    Resolution chain (single pass for all sessions):
+      1. sessions.json  — maps webchat chat_id → Hermes state.db session_id
+      2. state.db       — ``title`` column keyed by Hermes session_id
+
+    Returns a dict mapping chat_session_id → title string for every session
+    that has a non-empty title in state.db.
+    """
+    if not chat_session_ids:
+        return {}
+
+    hermes_home = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
+    sessions_dir = os.path.join(hermes_home, "sessions")
+    registry_path = os.path.join(sessions_dir, "sessions.json")
+    state_db_path = os.path.join(hermes_home, "state.db")
+
+    # Step 1: Build chat_id → hermes_session_id map from sessions.json
+    chat_id_to_hermes_id: Dict[str, str] = {}
+    try:
+        with open(registry_path, "r", encoding="utf-8") as f:
+            registry = json.load(f) or {}
+        id_set = set(chat_session_ids)
+        for entry in registry.values():
+            origin = entry.get("origin") or {}
+            cid = origin.get("chat_id", "")
+            if entry.get("platform") == "webchat" and cid in id_set:
+                hid = entry.get("session_id", "")
+                if hid:
+                    chat_id_to_hermes_id[cid] = hid
+    except Exception:
+        pass
+
+    if not chat_id_to_hermes_id:
+        return {}
+
+    # Step 2: Batch query state.db for all Hermes session titles
+    hermes_id_to_title: Dict[str, str] = {}
+    try:
+        conn = sqlite3.connect(f"file:{state_db_path}?mode=ro", uri=True, timeout=2)
+        try:
+            hermes_ids = list(chat_id_to_hermes_id.values())
+            placeholders = ",".join("?" * len(hermes_ids))
+            rows = conn.execute(
+                f"SELECT id, title FROM sessions WHERE id IN ({placeholders})",
+                hermes_ids,
+            ).fetchall()
+            for row in rows:
+                if row[1] and row[1].strip():
+                    hermes_id_to_title[row[0]] = row[1].strip()
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+    # Step 3: Combine — map chat_id → title
+    return {
+        cid: hermes_id_to_title[hid]
+        for cid, hid in chat_id_to_hermes_id.items()
+        if hid in hermes_id_to_title
+    }
+
+
+def _lookup_hermes_session_name(chat_session_id: str) -> Optional[str]:
+    """Single-session convenience wrapper around _lookup_hermes_session_names_batch."""
+    result = _lookup_hermes_session_names_batch([chat_session_id])
+    return result.get(chat_session_id)
 
 
 def _db_add_message(
@@ -356,6 +458,7 @@ def _db_add_message(
     reactions: Optional[Dict[str, Any]] = None,
     thinking: Optional[str] = None,
     blocks: Optional[list] = None,
+    sources: Optional[list] = None,
     message_id: Optional[str] = None,
 ) -> str:
     """Persist one chat message and update session metadata."""
@@ -366,6 +469,7 @@ def _db_add_message(
     encoded_reactions = json.dumps(reactions or {})
     encoded_thinking = thinking or ""
     encoded_blocks = json.dumps(blocks or [])
+    encoded_sources = json.dumps(sources or [])
     conn = sqlite3.connect(_DB_PATH)
     try:
         if role == "user":
@@ -386,19 +490,20 @@ def _db_add_message(
                     (_derive_title(content), session_id),
                 )
         conn.execute(
-            "INSERT OR REPLACE INTO messages "
-            "(id, session_id, role, content, attachments, interactions, reactions, thinking, blocks, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            'INSERT OR REPLACE INTO messages '
+            '(id, session_id, role, content, attachments, interactions, reactions, thinking, blocks, sources, created_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             (
                 msg_id,
                 session_id,
                 role,
-                content or "",
+                content or '',
                 encoded_attachments,
                 encoded_interactions,
                 encoded_reactions,
                 encoded_thinking,
                 encoded_blocks,
+                encoded_sources,
                 now,
             ),
         )
@@ -419,7 +524,8 @@ def _db_get_messages(session_id: str) -> list[Dict[str, Any]]:
     conn = sqlite3.connect(_DB_PATH)
     try:
         rows = conn.execute(
-            "SELECT id, role, content, attachments, interactions, reactions, thinking, blocks, created_at "
+            "SELECT id, role, content, attachments, interactions, "
+            "reactions, thinking, blocks, sources, created_at "
             "FROM messages WHERE session_id = ? ORDER BY created_at ASC",
             (session_id,),
         ).fetchall()
@@ -441,6 +547,11 @@ def _db_get_messages(session_id: str) -> list[Dict[str, Any]]:
                 blocks = json.loads(row[7] or "[]")
             except Exception:
                 blocks = []
+            try:
+                sources_raw = row[8] or "[]"
+                sources = json.loads(sources_raw)
+            except Exception:
+                sources = []
             messages.append({
                 "id": row[0],
                 "role": row[1],
@@ -450,8 +561,9 @@ def _db_get_messages(session_id: str) -> list[Dict[str, Any]]:
                 "reactions": reactions,
                 "thinking": row[6] or "",
                 "blocks": blocks,
+                "sources": sources,
                 "timestamp": datetime.fromtimestamp(
-                    row[8], tz=timezone.utc
+                    row[9], tz=timezone.utc
                 ).isoformat(),
             })
         return messages or _load_hermes_transcript_messages(session_id)
@@ -626,22 +738,37 @@ def _db_get_sessions(filter_by: str = "") -> list[Dict[str, Any]]:
             GROUP BY s.session_id
             ORDER BY COALESCE(s.pinned, 0) DESC, s.updated_at DESC
         """).fetchall()
+        # Batch-resolve AI-generated session names from Hermes state.db in one pass
+        all_session_ids = [row[0] for row in rows]
+        hermes_titles = _lookup_hermes_session_names_batch(all_session_ids)
+
         sessions = []
+        to_persist: list = []  # (session_id, title) pairs to write back
         for row in rows:
+            session_id = row[0]
             title = row[1]
             count = row[4]
-            if not title or title == "New conversation":
-                legacy_messages = _load_hermes_transcript_messages(row[0])
+
+            # Prefer the AI-generated title from Hermes state.db if it differs
+            hermes_name = hermes_titles.get(session_id)
+            if hermes_name and hermes_name != title:
+                title = hermes_name
+                to_persist.append((title[:120], session_id))
+            elif not title or title == "New conversation":
+                # Fall back to first user message from the legacy transcript
+                legacy_messages = _load_hermes_transcript_messages(session_id)
                 first_user = next(
                     (m.get("content", "") for m in legacy_messages if m.get("role") == "user"),
                     "",
                 )
                 if first_user:
                     title = _derive_title(first_user)
+                    to_persist.append((title[:120], session_id))
                 if legacy_messages and not count:
                     count = len(legacy_messages)
+
             sessions.append({
-                "session_id": row[0],
+                "session_id": session_id,
                 "title": title,
                 "created_at": row[2],
                 "updated_at": row[3],
@@ -650,6 +777,17 @@ def _db_get_sessions(filter_by: str = "") -> list[Dict[str, Any]]:
                 "archived": bool(row[6]) if len(row) > 6 else False,
                 "slug": row[7] if len(row) > 7 else "",
             })
+
+        # Persist discovered/enriched titles back into the webchat DB in one batch
+        if to_persist:
+            try:
+                conn.executemany(
+                    "UPDATE sessions SET title = ? WHERE session_id = ?",
+                    to_persist,
+                )
+                conn.commit()
+            except Exception:
+                pass
         return sessions
     finally:
         conn.close()
@@ -936,6 +1074,13 @@ class WebchatAdapter(BasePlatformAdapter):
         # publish and persist even if every subscriber disconnects.
         self._active_streams: Dict[str, _WebchatStreamState] = {}
         self._pending_interactions: Dict[str, Dict[str, Any]] = {}
+        # Blocking clarify/plan events — keyed by interaction_id
+        self._pending_clarify: Dict[str, threading.Event] = {}
+        self._pending_clarify_values: Dict[str, str] = {}
+        # Search sources state — keyed by chat_id (session_id)
+        self._sources_state: Dict[str, list[Dict[str, str]]] = {}
+        # Main event loop — set during connect()
+        self._loop: asyncio.AbstractEventLoop | None = None
     
     # ── Lifecycle ───────────────────────────────────────────────────────
     
@@ -951,6 +1096,8 @@ class WebchatAdapter(BasePlatformAdapter):
             logger.error("Webchat: Failed to initialise database: %s", e)
             return False
         
+        # Store reference to the asyncio event loop for cross-thread callbacks
+        self._loop = asyncio.get_running_loop()
         # Validate configuration
         if not self._username or not self._password_hash or not self._jwt_secret:
             logger.error(
@@ -1251,16 +1398,6 @@ class WebchatAdapter(BasePlatformAdapter):
         frontend can display a real-time tool usage indicator in the
         reasoning block.
         """
-        import os
-        _diag_path = "/tmp/hermes_tool_diag.txt"
-        with open(_diag_path, "a") as f:
-            f.write(f"[{__import__('datetime').datetime.now()}] send_tool_call ENTERED chat_id={chat_id} tool={tool}\n")
-        # Check if a live stream exists
-        _q = self._active_streams.get(chat_id)
-        with open(_diag_path, "a") as f:
-            f.write(f"[{__import__('datetime').datetime.now()}] send_tool_call queue={'EXISTS' if _q else 'NONE'}\n")
-            if _q:
-                f.write(f"[{__import__('datetime').datetime.now()}] send_tool_call events={len(_q.events)} subscribers={len(_q.subscribers)}\n")
         args_preview = json.dumps(args, ensure_ascii=False, default=str)
         if len(args_preview) > 200:
             args_preview = args_preview[:197] + "..."
@@ -1278,6 +1415,266 @@ class WebchatAdapter(BasePlatformAdapter):
             "content": f"**{tool}**\n{args_preview}",
             "interaction": interaction,
         })
+
+        # ── Sources: intercept search tool results ───────────────────────
+        search_tools = {
+            "mcp_brave_search_brave_web_search",
+            "mcp_brave_search_brave_local_search",
+            "mcp_brave_llm_context_brave_llm_context",
+            "brave_web_search", "web_search",
+            "mcp_brave_search_brave_news_search",
+            "mcp_brave_search_brave_video_search",
+        }
+        if tool in search_tools:
+            sources = self._extract_sources(result_summary, args)
+            if sources:
+                existing = self._sources_state.get(chat_id, [])
+                seen_urls = {s["url"] for s in existing}
+                for s in sources:
+                    if s["url"] not in seen_urls:
+                        existing.append(s)
+                        seen_urls.add(s["url"])
+                self._sources_state[chat_id] = existing[-5:]
+                await self._queue_event(chat_id, {
+                    "type": "sources_update",
+                    "session_id": chat_id,
+                    "sources": self._sources_state[chat_id],
+                })
+
+    async def send_tool_result(
+        self,
+        chat_id: str,
+        tool: str,
+        function_result: Any,
+    ) -> None:
+        """Process a completed search tool's actual result and emit sources.
+
+        Called by tool_complete_callback in the gateway runner — fires
+        *after* the tool returns, so ``function_result`` contains the real
+        search results (unlike ``send_tool_call`` which only has the args).
+        """
+        search_tools = {
+            "mcp_brave_search_brave_web_search",
+            "mcp_brave_search_brave_local_search",
+            "mcp_brave_llm_context_brave_llm_context",
+            "brave_web_search",
+            "web_search",
+            "mcp_brave_search_brave_news_search",
+            "mcp_brave_search_brave_video_search",
+        }
+        if tool not in search_tools:
+            return
+
+        result_str = ""
+        if isinstance(function_result, str):
+            result_str = function_result
+        elif isinstance(function_result, dict):
+            result_str = json.dumps(function_result, default=str)
+        elif isinstance(function_result, (list, tuple)):
+            result_str = json.dumps(function_result, default=str)
+        else:
+            result_str = str(function_result)
+
+        sources = self._extract_sources(result_str, None)
+        if not sources:
+            return
+
+        existing = self._sources_state.get(chat_id, [])
+        seen_urls = {s["url"] for s in existing}
+        for s in sources:
+            if s["url"] not in seen_urls:
+                existing.append(s)
+                seen_urls.add(s["url"])
+        self._sources_state[chat_id] = existing[-5:]
+        await self._queue_event(chat_id, {
+            "type": "sources_update",
+            "session_id": chat_id,
+            "sources": self._sources_state[chat_id],
+        })
+
+    @staticmethod
+    def _extract_sources(result_summary: str, args: Dict[str, Any] | None = None) -> list[Dict[str, str]]:
+        """
+        Parse search tool result summaries into structured source objects.
+
+        Tries two approaches:
+        1. If result_summary is JSON with a ``results`` array, extract URLs.
+        2. If args has a ``query`` field, construct a Brave search link card.
+        """
+        import json as _json
+        import urllib.parse
+
+        text = (result_summary or "").strip()
+        sources: list[Dict[str, str]] = []
+
+        # Helper to extract hostname from URL
+        def _hostname(url: str) -> str:
+            try:
+                return urllib.parse.urlparse(url).netloc
+            except Exception:
+                return url
+
+        # Approach 1: full search result JSON with a results array
+        # Unwrap MCP `{"result": "..."}` envelope: the MCP tool handler
+        # (mcp_tool.py:2272) wraps ALL tool output in ``{"result": ...}``,
+        # double-encoding inner JSON as a string.  Peel the envelope so we
+        # can reach the actual search results.
+        inner_text: str | None = None
+        if text.startswith("{") or text.startswith("["):
+            try:
+                data = _json.loads(text)
+                # Peel MCP wrapper if present
+                if "result" in data and isinstance(data["result"], str):
+                    inner_val = data["result"].strip()
+                    if inner_val.startswith(("{", "[")):
+                        try:
+                            inner = _json.loads(inner_val)
+                            if isinstance(inner, list):
+                                data = {"results": inner}
+                            elif isinstance(inner, dict):
+                                data = inner
+                        except _json.JSONDecodeError:
+                            pass
+                    else:
+                        # Non-JSON MCP envelope (brave_llm_context plain text)
+                        inner_text = inner_val
+                raw_results = data.get("results", data.get("web", {}).get("results", []))
+                if isinstance(raw_results, list):
+                    for r in raw_results:
+                        url = r.get("url", "")
+                        if url:
+                            snippet = r.get("description", r.get("snippet", r.get("content", "")))
+                            sources.append({
+                                "title": r.get("title", url)[:120],
+                                "url": url,
+                                "snippet": str(snippet)[:200] if snippet else "",
+                                "domain": r.get("source", r.get("hostname", _hostname(url))),
+                            })
+                if sources:
+                    return sources
+            except json.JSONDecodeError:
+                pass
+
+        # Approach 2: brave_llm_context plain-text format
+        # The LLM Context MCP returns results as:
+        #   ## Result N: Title\nURL: https://...\n\nContent...\n\n---\n
+        llm_text = inner_text or text
+        if not sources and ("## Result " in llm_text):
+            import re as _re
+            for match in _re.finditer(
+                r'##\s+Result\s+\d+:\s*(.+?)\s*\n\s*URL:\s*(\S+)',
+                llm_text,
+            ):
+                title = match.group(1).strip()[:120]
+                url = match.group(2).strip()
+                if url:
+                    sources.append({
+                        "title": title or url[:120],
+                        "url": url,
+                        "snippet": "",
+                        "domain": _hostname(url),
+                    })
+            if sources:
+                return sources
+
+        # Approach 3: tool args with a query field (fallback search link)
+        if args and args.get("query"):
+            q = args["query"]
+            q_encoded = urllib.parse.quote(q[:200])
+            sources.append({
+                "title": f"Search: {q[:80]}",
+                "url": f"https://search.brave.com/search?q={q_encoded}",
+                "snippet": "",
+                "domain": "Brave Search",
+            })
+        return sources
+
+    async def send_clarify(
+        self,
+        chat_id: str,
+        question: str,
+        choices: list[str] | None = None,
+        timeout: float = 120.0,
+    ) -> str:
+        """
+        Present a multi-choice or open-ended question to the user and wait
+        for a response. Blocks the agent via threading.Event.
+
+        Returns the user's selected value, or "(clarify timed out)" on timeout.
+        """
+        controls: list[Dict[str, Any]] = []
+        if choices:
+            for i, choice in enumerate(choices):
+                controls.append({
+                    "label": choice,
+                    "value": choice,
+                    "variant": "secondary",
+                })
+        else:
+            controls.append({
+                "label": "Type your answer...",
+                "value": "__open__",
+                "variant": "ghost",
+            })
+
+        interaction = self._register_interaction(
+            chat_id=chat_id,
+            kind="clarify_response",
+            title="🤔 " + question,
+            content="",
+            controls=controls,
+        )
+        interaction_id = interaction["id"]
+        # Use threading.Event for cross-thread signalling (agent runs in executor)
+        import threading as _threading
+        event = _threading.Event()
+        self._pending_clarify[interaction_id] = event
+        self._pending_clarify_values[interaction_id] = ""
+
+        _db_add_message(chat_id, "assistant", f"**{question}**", interactions=[interaction])
+
+        queued = await self._queue_event(chat_id, {
+            "type": "interaction",
+            "session_id": chat_id,
+            "content": question,
+            "interaction": interaction,
+        })
+
+        # Wait in a thread so the asyncio event loop isn't blocked
+        import concurrent.futures as _futures
+        loop = asyncio.get_running_loop()
+        def _wait():
+            return event.wait(timeout=timeout)
+        waited = await loop.run_in_executor(None, _wait)
+
+        if not waited:
+            self._pending_clarify.pop(interaction_id, None)
+            self._pending_clarify_values.pop(interaction_id, None)
+            return "(clarify timed out)"
+
+        value = self._pending_clarify_values.pop(interaction_id, "")
+        self._pending_clarify.pop(interaction_id, None)
+        return value
+
+    def create_clarify_callback(self, chat_id: str):
+        """
+        Return a callable (question, choices) -> str suitable for passing
+        as AIAgent's clarify_callback.
+
+        The callback is called from the agent's executor thread. send_clarify
+        uses threading.Event for cross-thread signalling and schedules the
+        actual async work on the main event loop.
+        """
+        adapter = self
+
+        def _cb(question: str, choices: list[str] | None = None) -> str:
+            coro = adapter.send_clarify(chat_id, question, choices)
+            if adapter._loop is not None:
+                future = asyncio.run_coroutine_threadsafe(coro, adapter._loop)
+                return future.result()
+            return asyncio.run(coro)
+
+        return _cb
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, str]:
         """Return metadata about a chat conversation."""
@@ -1389,6 +1786,7 @@ class WebchatAdapter(BasePlatformAdapter):
                     interactions=state.final_interactions,
                     thinking=state.final_thinking,
                     blocks=state.final_blocks,
+                    sources=state.final_sources,
                     message_id=final_message_id or None,
                 )
                 state.final_message_id = final_message_id
@@ -1854,6 +2252,8 @@ class WebchatAdapter(BasePlatformAdapter):
 
         state = _WebchatStreamState(session_id)
         self._active_streams[session_id] = state
+        # Reset per-turn state
+        self._sources_state.pop(session_id, None)
         
         try:
             # Build a MessageEvent as required by the Hermes gateway
@@ -2336,6 +2736,22 @@ class WebchatAdapter(BasePlatformAdapter):
 
             if kind == "model_select":
                 return await self._model_picker_model_response(action_id, entry, value)
+
+            # ── Clarify response ──────────────────────────────────────────
+            if kind == "clarify_response":
+                self._pending_clarify_values[action_id] = value
+                ev = self._pending_clarify.pop(action_id, None)
+                if ev and not ev.is_set():
+                    ev.set()
+                interaction["disabled"] = True
+                interaction["selected"] = value
+                _db_update_interaction(action_id, interaction)
+                self._pending_interactions.pop(action_id, None)
+                return self._json_response({
+                    "status": "ok",
+                    "interaction": interaction,
+                    "message": None,
+                })
 
             return self._json_response({"error": "Unsupported action type"}, status=400)
         except Exception as e:
