@@ -40,7 +40,7 @@ import threading
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set
 
 # ---------------------------------------------------------------------------
 # Hermes gateway imports — these live inside the Hermes package and are
@@ -58,6 +58,9 @@ from gateway.platforms.base import (
     MessageType,
     ProcessingOutcome,
 )
+
+# Process notification polling — singleton registry tracks running processes
+from tools.process_registry import process_registry
 from gateway.session import SessionSource, build_session_key
 from gateway.config import PlatformConfig, Platform
 
@@ -66,11 +69,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def _generate_slug() -> str:
-    """Generate a short random URL slug (6 alphanumeric chars)."""
-    return "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
-
 
 def _extract_hostname(url: str) -> str:
     """Extract hostname from a URL, falling back to empty string."""
@@ -187,8 +185,7 @@ def _init_db() -> None:
                 updated_at REAL NOT NULL,
                 message_count INTEGER DEFAULT 0,
                 pinned INTEGER DEFAULT 0,
-                archived INTEGER DEFAULT 0,
-                slug TEXT NOT NULL DEFAULT ''
+                archived INTEGER DEFAULT 0
             )
         """)
         conn.execute("""
@@ -247,31 +244,8 @@ def _init_db() -> None:
             )
         if "archived" not in sess_columns:
             conn.execute(
-                "ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0"
+                'ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0'
             )
-        if "slug" not in sess_columns:
-            conn.execute(
-                "ALTER TABLE sessions ADD COLUMN slug TEXT NOT NULL DEFAULT ''"
-            )
-
-        # Backfill slugs for existing sessions that have empty slugs.
-        # Each session gets a unique slug; retry on collision for each row.
-        empty_rows = conn.execute(
-            "SELECT session_id FROM sessions WHERE slug IS NULL OR slug = ''"
-        ).fetchall()
-        for (sid,) in empty_rows:
-            for _ in range(5):
-                new_slug = _generate_slug()
-                existing = conn.execute(
-                    "SELECT 1 FROM sessions WHERE slug = ? AND session_id != ?",
-                    (new_slug, sid),
-                ).fetchone()
-                if not existing:
-                    conn.execute(
-                        "UPDATE sessions SET slug = ? WHERE session_id = ?",
-                        (new_slug, sid),
-                    )
-                    break
 
         # Add hermes_session_id column to track the Hermes session behind each webchat conversation
         if "hermes_session_id" not in sess_columns:
@@ -294,43 +268,14 @@ def _init_db() -> None:
 
 
 def _db_add_session(session_id: str, title: str = "New conversation") -> None:
-    """Persist a new session, or ensure an existing session has a slug."""
+    """Persist a new session if it doesn't already exist."""
     now = time.time()
     conn = sqlite3.connect(_DB_PATH)
     try:
-        # Check if session already exists
-        row = conn.execute(
-            "SELECT slug FROM sessions WHERE session_id = ?", (session_id,)
-        ).fetchone()
-        if row is None:
-            # New session — generate a unique slug
-            slug = _generate_slug()
-            for _ in range(5):
-                slug = _generate_slug()
-                existing = conn.execute(
-                    "SELECT slug FROM sessions WHERE slug = ?", (slug,)
-                ).fetchone()
-                if not existing:
-                    break
-            conn.execute(
-                "INSERT OR IGNORE INTO sessions (session_id, title, slug, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-                (session_id, title, slug, now, now),
-            )
-        elif not row[0]:
-            # Existing session with empty slug — backfill one
-            slug = _generate_slug()
-            for _ in range(5):
-                slug = _generate_slug()
-                existing = conn.execute(
-                    "SELECT slug FROM sessions WHERE slug = ? AND session_id != ?",
-                    (slug, session_id),
-                ).fetchone()
-                if not existing:
-                    break
-            conn.execute(
-                "UPDATE sessions SET slug = ?, updated_at = ? WHERE session_id = ?",
-                (slug, now, session_id),
-            )
+        conn.execute(
+            "INSERT OR IGNORE INTO sessions (session_id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            (session_id, title, now, now),
+        )
         conn.commit()
     finally:
         conn.close()
@@ -478,11 +423,10 @@ def _db_add_message(
                 (session_id,),
             ).fetchone()
             if row is None:
-                slug = _generate_slug()
                 conn.execute(
-                    "INSERT INTO sessions (session_id, title, slug, created_at, updated_at, message_count) "
-                    "VALUES (?, ?, ?, ?, ?, 0)",
-                    (session_id, _derive_title(content), slug, now, now),
+                    "INSERT INTO sessions (session_id, title, created_at, updated_at, message_count) "
+                    "VALUES (?, ?, ?, ?, 0)",
+                    (session_id, _derive_title(content), now, now),
                 )
             elif not row[0] or row[0] == "New conversation":
                 conn.execute(
@@ -730,8 +674,7 @@ def _db_get_sessions(filter_by: str = "") -> list[Dict[str, Any]]:
                 s.updated_at,
                 COALESCE(NULLIF(COUNT(m.id), 0), s.message_count),
                 s.pinned,
-                s.archived,
-                s.slug
+                s.archived
             FROM sessions s
             LEFT JOIN messages m ON m.session_id = s.session_id
             {where_clause}
@@ -775,7 +718,6 @@ def _db_get_sessions(filter_by: str = "") -> list[Dict[str, Any]]:
                 "message_count": count,
                 "pinned": bool(row[5]) if len(row) > 5 else False,
                 "archived": bool(row[6]) if len(row) > 6 else False,
-                "slug": row[7] if len(row) > 7 else "",
             })
 
         # Persist discovered/enriched titles back into the webchat DB in one batch
@@ -1081,6 +1023,10 @@ class WebchatAdapter(BasePlatformAdapter):
         self._sources_state: Dict[str, list[Dict[str, str]]] = {}
         # Main event loop — set during connect()
         self._loop: asyncio.AbstractEventLoop | None = None
+        
+        # SSE client tracking for /api/events (process notifications)
+        self._sse_clients: Set[asyncio.Queue] = set()
+        self._poll_task: Optional[asyncio.Task] = None
     
     # ── Lifecycle ───────────────────────────────────────────────────────
     
@@ -1118,15 +1064,124 @@ class WebchatAdapter(BasePlatformAdapter):
         
         logger.info("Webchat: HTTP server listening on %s:%s", self._host, self._port)
         logger.info("Webchat: SPA directory: %s", self._spa_dir)
+        
+        # Start background task to poll process completion events
+        self._poll_task = asyncio.create_task(self._poll_completion_queue())
+        
         self._mark_connected()
         return True
     
     async def disconnect(self) -> None:
         """Shut down the HTTP server cleanly."""
+        # Stop the completion queue poll task
+        if self._poll_task:
+            self._poll_task.cancel()
+            try:
+                await self._poll_task
+            except asyncio.CancelledError:
+                pass
+            self._poll_task = None
+        # Disconnect all SSE clients
+        for q in self._sse_clients:
+            await q.put(None)  # Sentinel to signal shutdown
+        self._sse_clients.clear()
         if self._runner:
             await self._runner.cleanup()
         self._mark_disconnected()
         logger.info("Webchat: HTTP server stopped")
+    
+    # ── Process completion event polling ──────────────────────────────────
+    
+    async def _poll_completion_queue(self) -> None:
+        """Background task: poll process_registry.completion_queue and 
+        broadcast events to all connected /api/events SSE clients.
+        """
+        try:
+            while True:
+                try:
+                    # Block until a completion event arrives (with timeout
+                    # so we can check for cancellation periodically)
+                    evt = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: process_registry.completion_queue.get(timeout=5)
+                    )
+                except Exception:
+                    # Timeout or queue error — just loop
+                    continue
+                
+                if evt is None:
+                    continue
+                
+                # Format the event for the frontend
+                evt_type = evt.get("type", "completion")
+                payload = {
+                    "type": "process_event",
+                    "event_type": evt_type,
+                    "session_id": evt.get("session_id", ""),
+                    "command": evt.get("command", ""),
+                    "exit_code": evt.get("exit_code"),
+                    "output": evt.get("output", ""),
+                    "pattern": evt.get("pattern"),
+                    "message": evt.get("message"),
+                }
+                
+                # Broadcast to all connected SSE clients
+                dead_clients = []
+                for q in self._sse_clients:
+                    try:
+                        await q.put(payload)
+                    except asyncio.QueueFull:
+                        dead_clients.append(q)
+                for q in dead_clients:
+                    self._sse_clients.discard(q)
+        except asyncio.CancelledError:
+            pass
+    
+    async def _handle_events(self, request: web.Request) -> web.StreamResponse:
+        """SSE endpoint: /api/events — streams process completion events.
+        
+        Clients connect via EventSource and receive JSON events as they arrive.
+        Connection stays open indefinitely; client should reconnect on error.
+        """
+        # Verify auth
+        token = self._extract_token(request)
+        if not token:
+            raise web.HTTPUnauthorized()
+        try:
+            jwt.decode(token, self._jwt_secret, algorithms=["HS256"])
+        except Exception:
+            raise web.HTTPUnauthorized()
+        
+        response = web.StreamResponse(
+            status=200,
+            reason="OK",
+            headers={
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+                "Access-Control-Allow-Origin": "*",
+            },
+        )
+        await response.prepare(request)
+        
+        client_queue: asyncio.Queue = asyncio.Queue(maxsize=100)
+        self._sse_clients.add(client_queue)
+        
+        try:
+            while True:
+                evt = await client_queue.get()
+                if evt is None:
+                    break  # Shutdown sentinel
+                
+                data = json.dumps(evt)
+                await response.write(f"data: {data}\n\n".encode("utf-8"))
+                await response.drain()
+        except (asyncio.CancelledError, ConnectionResetError, ConnectionAbortedError):
+            pass
+        finally:
+            self._sse_clients.discard(client_queue)
+        
+        return response
     
     # ── Message handling ─────────────────────────────────────────────────
     
@@ -1228,6 +1283,9 @@ class WebchatAdapter(BasePlatformAdapter):
         """
         # MEDIA:/path markers pass through inline — same rationale as send().
         state = self._active_streams.get(chat_id)
+        if state and not getattr(state, "_response_logged", False):
+            state._response_logged = True
+            await self._log_ttft(str(chat_id), "first_response")
         if state is None:
             logger.warning("Webchat: No active stream for edit in session %s", chat_id)
             return SendResult(success=False, message_id=message_id, error="No pending response")
@@ -1356,6 +1414,9 @@ class WebchatAdapter(BasePlatformAdapter):
         "Hermes is thinking..." while the agent processes the request.
         """
         state = self._active_streams.get(chat_id)
+        if state and not getattr(state, "_typing_logged", False):
+            state._typing_logged = True
+            await self._log_ttft(str(chat_id), "first_typing")
         if state:
             try:
                 await state.publish({"type": "typing", "session_id": chat_id})
@@ -1375,6 +1436,9 @@ class WebchatAdapter(BasePlatformAdapter):
         into its collapsible "Thinking..." disclosure block.
         """
         state = self._active_streams.get(chat_id)
+        if state and not getattr(state, "_reasoning_logged", False):
+            state._reasoning_logged = True
+            await self._log_ttft(str(chat_id), "first_reasoning")
         if state:
             try:
                 await state.publish({
@@ -2021,6 +2085,27 @@ class WebchatAdapter(BasePlatformAdapter):
         except Exception:
             pass
 
+    _ttft_timestamps: Dict[str, float] = {}
+    _ttft_file = os.path.join(
+        os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")),
+        "webchat_ttft.log",
+    )
+
+    async def _log_ttft(self, session_id: str, stage: str) -> None:
+        """Log TTFT timing for a given session and stage."""
+        now = time.monotonic()
+        first = self._ttft_timestamps.get(session_id)
+        if first is None:
+            first = now
+            self._ttft_timestamps[session_id] = first
+        elapsed = now - first
+        line = f"[TTFT session={session_id[:16]}] t=+{elapsed:.3f}s stage={stage}\n"
+        try:
+            with open(self._ttft_file, "a") as f:
+                f.write(line)
+        except Exception:
+            pass
+
     async def on_processing_complete(
         self,
         event: MessageEvent,
@@ -2063,13 +2148,15 @@ class WebchatAdapter(BasePlatformAdapter):
         self._app.router.add_post("/api/model", self._handle_set_model)
         self._app.router.add_post("/api/actions/{action_id}", self._handle_action)
 
+        # Process event stream (SSE)
+        self._app.router.add_get("/api/events", self._handle_events)
+
         # User settings
         self._app.router.add_get("/api/settings", self._handle_get_settings)
         self._app.router.add_post("/api/settings", self._handle_post_settings)
 
         # Session management
         self._app.router.add_get("/api/sessions", self._handle_list_sessions)
-        self._app.router.add_get("/api/sessions/slug/{slug}", self._handle_session_by_slug)
         self._app.router.add_get(
             "/api/sessions/{session_id}/messages", self._handle_get_messages
         )
@@ -2246,12 +2333,14 @@ class WebchatAdapter(BasePlatformAdapter):
                 status=409,
             )
 
+        await self._log_ttft(session_id, "db_done")
         # Register the session in the database if new
         _db_add_session(session_id)
         _db_add_message(session_id, "user", message_text, attachments)
 
         state = _WebchatStreamState(session_id)
         self._active_streams[session_id] = state
+        await self._log_ttft(session_id, "state_created")
         # Reset per-turn state
         self._sources_state.pop(session_id, None)
         
@@ -2290,13 +2379,17 @@ class WebchatAdapter(BasePlatformAdapter):
                 group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
                 thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
             )
+            await self._log_ttft(session_id, "before_handle_message")
             await self.handle_message(event)
+            await self._log_ttft(session_id, "after_handle_message")
             handler_task = self._session_tasks.get(session_key)
-            
+
             asyncio.create_task(
                 self._finalize_stream_state(session_id, state, handler_task)
             )
-            return await self._stream_state_to_response(request, state)
+            resp = await self._stream_state_to_response(request, state)
+            await self._log_ttft(session_id, "after_stream_response")
+            return resp
         
         except Exception as e:
             logger.error("Webchat: Error handling send request: %s", e)
@@ -2943,25 +3036,6 @@ class WebchatAdapter(BasePlatformAdapter):
         except Exception as e:
             return self._json_response({"error": str(e)}, status=500)
     
-    async def _handle_session_by_slug(self, request: web.Request) -> web.Response:
-        """GET /api/sessions/slug/{slug} — look up a session by its slug."""
-        payload = self._require_auth(request)
-        if not payload:
-            return self._json_response({"error": "Unauthorised"}, status=401)
-        
-        slug = request.match_info.get("slug", "")
-        if not slug:
-            return self._json_response({"error": "Slug required"}, status=400)
-        
-        try:
-            sessions = _db_get_sessions()
-            for s in sessions:
-                if s.get("slug") == slug:
-                    return self._json_response({"session": s})
-            return self._json_response({"error": "Session not found"}, status=404)
-        except Exception as e:
-            return self._json_response({"error": str(e)}, status=500)
-    
     async def _handle_get_messages(self, request: web.Request) -> web.Response:
         """GET /api/sessions/{session_id}/messages — load persisted messages."""
         payload = self._require_auth(request)
@@ -3331,6 +3405,14 @@ def register(ctx):
             "basic lucide-react icon imports are also available. Prefer Mermaid "
             "for static diagrams and artifacts only for interactive UI, charts, "
             "or demos. Raw inline HTML in normal markdown is not rendered; place "
-            "HTML in an artifact-html fence when needed."
+            "HTML in an artifact-html fence when needed. "
+            "Reasoning Effort: Absolute maximum with no shortcuts permitted. "
+            "You MUST be very thorough in your thinking and comprehensively "
+            "decompose the problem to resolve the root cause, rigorously "
+            "stress-testing your logic against all potential paths, edge cases, "
+            "and adversarial scenarios. Explicitly write out your entire "
+            "deliberation process, documenting every intermediate step, "
+            "considered alternative, and rejected hypothesis to ensure absolutely "
+            "no assumption is left unchecked."
         ),
     )
