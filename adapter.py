@@ -2372,6 +2372,9 @@ class WebchatAdapter(BasePlatformAdapter):
         self._app.router.add_post(
             "/api/push/poll", self._handle_push_poll
         )
+        self._app.router.add_post(
+            "/api/push/action", self._handle_push_action
+        )
         
         # Static file serving — must be last since it catches all paths
         # We use a custom handler that falls back to index.html for SPA routing
@@ -3552,6 +3555,7 @@ class WebchatAdapter(BasePlatformAdapter):
         title = data.get("title", "Hermes")
         body = data.get("body", "")
         session_id = data.get("session_id", "")
+        category = data.get("category", "")  # "confirm", "reply", or "" for default
 
         # If we have a user_id from JWT, send only to that user.
         # If called via API key (no user_id), check body for user_id override,
@@ -3629,14 +3633,21 @@ class WebchatAdapter(BasePlatformAdapter):
                         continue
 
                 try:
+                    # Build data payload for the FCM message
+                    fcm_data: Dict[str, str] = {}
+                    if session_id:
+                        fcm_data["session_id"] = session_id
+                        fcm_data["type"] = "open_chat"
+                    if category:
+                        fcm_data["categoryId"] = category
+
                     msg = _fa_msg.Message(
                         notification=_fa_msg.Notification(title=title, body=body),
                         token=device["token"],
                         android=_fa_msg.AndroidConfig(
                             priority="high",
                         ),
-                        data={"session_id": session_id, "type": "open_chat"}
-                        if session_id else {},
+                        data=fcm_data,
                     )
                     resp = _fa_msg.send(msg)
                     results.append({
@@ -3763,6 +3774,93 @@ class WebchatAdapter(BasePlatformAdapter):
         return self._json_response({
             "status": "ok",
             "notifications": notifications,
+        })
+
+    async def _handle_push_action(self, request: web.Request) -> web.Response:
+        """POST /api/push/action — handle a push notification action response.
+
+        When the user taps an action button (Approve/Reject/Reply) on a push
+        notification, this endpoint receives the response and injects it into
+        the appropriate chat session as a user message for the agent to process.
+
+        Request body (JSON):
+            {
+                "action_id": "approve|reject|reply",
+                "user_text": "",         // text input content (reply action)
+                "session_id": "sess-abc",
+                "message": "/approve"    // message text to inject into session
+            }
+
+        Auth: JWT (standard Bearer token).
+        """
+        payload = self._require_auth(request)
+        if not payload:
+            return self._json_response({"error": "Unauthorised"}, status=401)
+
+        try:
+            data = await request.json()
+        except json.JSONDecodeError:
+            return self._json_response({"error": "Invalid JSON"}, status=400)
+
+        action_id = data.get("action_id", "")
+        session_id = data.get("session_id", "")
+        message_text = data.get("message", "")
+
+        if not session_id:
+            return self._json_response({"error": "session_id is required"}, status=400)
+        if not message_text:
+            return self._json_response({"error": "message is required"}, status=400)
+
+        user_id = payload.get("user_id", "unknown")
+        username = payload.get("username", "unknown")
+
+        # Register the session in the database
+        _db_add_session(session_id)
+        _db_add_message(session_id, "user", message_text, [])
+
+        # Set up stream state so the gateway's response callbacks work
+        state = _WebchatStreamState(session_id)
+        self._active_streams[session_id] = state
+
+        # Build a MessageEvent and dispatch to the gateway
+        source = self.build_source(
+            chat_id=session_id,
+            chat_name="Web Chat",
+            chat_type="dm",
+            user_id=user_id,
+            user_name=username,
+        )
+
+        event = MessageEvent(
+            text=message_text,
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id=str(uuid.uuid4()),
+        )
+
+        # Dispatch and track the handler task for finalization
+        await self.handle_message(event)
+        session_key = build_session_key(
+            source,
+            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+        )
+        handler_task = self._session_tasks.get(session_key)
+
+        # Finalize in background — writes completed response to DB
+        asyncio.create_task(
+            self._finalize_stream_state(session_id, state, handler_task)
+        )
+
+        logger.info(
+            "Push action: user=%s action=%s session=%s text=%s",
+            user_id, action_id, session_id, message_text,
+        )
+
+        return self._json_response({
+            "status": "ok",
+            "action_id": action_id,
+            "session_id": session_id,
         })
 
     async def _handle_static(self, request: web.Request) -> web.Response:
