@@ -1837,11 +1837,14 @@ class WebchatAdapter(BasePlatformAdapter):
         chat_id: str,
         question: str,
         choices: list[str] | None = None,
-        timeout: float = 120.0,
+        timeout: float = 600.0,
     ) -> str:
         """
         Present a multi-choice or open-ended question to the user and wait
         for a response. Blocks the agent via threading.Event.
+
+        Also sends a push notification to the user's Android device with the
+        same choices, enabling response via either the web UI or notification.
 
         Returns the user's selected value, or "(clarify timed out)" on timeout.
         """
@@ -1883,6 +1886,11 @@ class WebchatAdapter(BasePlatformAdapter):
             "interaction": interaction,
         })
 
+        # Send push notification with clarify data (fire and forget)
+        asyncio.create_task(
+            self._send_clarify_push(question, choices, interaction_id, chat_id)
+        )
+
         # Wait in a thread so the asyncio event loop isn't blocked
         import concurrent.futures as _futures
         loop = asyncio.get_running_loop()
@@ -1897,6 +1905,12 @@ class WebchatAdapter(BasePlatformAdapter):
 
         value = self._pending_clarify_values.pop(interaction_id, "")
         self._pending_clarify.pop(interaction_id, None)
+
+        # Dismiss the push notification if clarify was resolved (by any means)
+        asyncio.create_task(
+            self._dismiss_clarify_push(interaction_id)
+        )
+
         return value
 
     def create_clarify_callback(self, chat_id: str):
@@ -3633,21 +3647,22 @@ class WebchatAdapter(BasePlatformAdapter):
                         continue
 
                 try:
-                    # Build data payload for the FCM message
-                    fcm_data: Dict[str, str] = {}
+                    # Data-only FCM — HermesFcmService builds the notification
+                    fcm_data: Dict[str, str] = {
+                        "title": title,
+                        "body": body,
+                        "type": "notification",
+                    }
                     if session_id:
                         fcm_data["session_id"] = session_id
-                        fcm_data["type"] = "open_chat"
+                        fcm_data["type"] = "notification"
                     if category:
                         fcm_data["categoryId"] = category
 
                     msg = _fa_msg.Message(
-                        notification=_fa_msg.Notification(title=title, body=body),
-                        token=device["token"],
-                        android=_fa_msg.AndroidConfig(
-                            priority="high",
-                        ),
                         data=fcm_data,
+                        token=device["token"],
+                        android=_fa_msg.AndroidConfig(priority="high"),
                     )
                     resp = _fa_msg.send(msg)
                     results.append({
@@ -3776,19 +3791,126 @@ class WebchatAdapter(BasePlatformAdapter):
             "notifications": notifications,
         })
 
+    # ── Clarify push helpers ──────────────────────────────────────────
+
+    async def _send_clarify_push(
+        self,
+        question: str,
+        choices: list[str] | None,
+        interaction_id: str,
+        session_id: str,
+    ) -> None:
+        """Send a data-only FCM push to the user's device with clarify data."""
+        user_id = f"user-{self._username}"
+        tokens = _get_device_tokens(user_id)
+        if not tokens:
+            return
+
+        data: Dict[str, str] = {
+            "type": "clarify",
+            "session_id": session_id,
+            "interaction_id": interaction_id,
+            "question": question,
+            "tag": f"clarify-{interaction_id}",
+        }
+        if choices:
+            data["choices"] = ",".join(choices)
+
+        for device in tokens:
+            platform = device.get("platform", "")
+            if platform != "android-fcm":
+                continue
+            try:
+                import firebase_admin as _fa2
+                from firebase_admin import credentials as _fa_cred2, messaging as _fa_msg2
+            except ImportError:
+                continue
+
+            if not _fa2._apps:
+                sa_path = os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)),
+                    "..", "..", "..", "firebase-service-account.json",
+                )
+                fallback = os.path.expanduser("~/.hermes/firebase-service-account.json")
+                cred_path = sa_path if os.path.isfile(sa_path) else fallback
+                try:
+                    cred = _fa_cred2.Certificate(cred_path)
+                    _fa2.initialize_app(cred)
+                except Exception:
+                    continue
+
+            try:
+                msg = _fa_msg2.Message(
+                    data=data,
+                    token=device["token"],
+                    android=_fa_msg2.AndroidConfig(priority="high"),
+                )
+                _fa_msg2.send(msg)
+            except Exception:
+                continue
+
+    async def _dismiss_clarify_push(self, interaction_id: str) -> None:
+        """Send a data-only FCM dismiss message to cancel the clarify notification."""
+        user_id = f"user-{self._username}"
+        tokens = _get_device_tokens(user_id)
+        if not tokens:
+            return
+
+        data: Dict[str, str] = {
+            "type": "dismiss",
+            "tag": f"clarify-{interaction_id}",
+        }
+
+        for device in tokens:
+            platform = device.get("platform", "")
+            if platform != "android-fcm":
+                continue
+            try:
+                import firebase_admin as _fa3
+                from firebase_admin import credentials as _fa_cred3, messaging as _fa_msg3
+            except ImportError:
+                continue
+
+            if not _fa3._apps:
+                sa_path = os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)),
+                    "..", "..", "..", "firebase-service-account.json",
+                )
+                fallback = os.path.expanduser("~/.hermes/firebase-service-account.json")
+                cred_path = sa_path if os.path.isfile(sa_path) else fallback
+                try:
+                    cred = _fa_cred3.Certificate(cred_path)
+                    _fa3.initialize_app(cred)
+                except Exception:
+                    continue
+
+            try:
+                msg = _fa_msg3.Message(
+                    data=data,
+                    token=device["token"],
+                    android=_fa_msg3.AndroidConfig(priority="high"),
+                )
+                _fa_msg3.send(msg)
+            except Exception:
+                continue
+
     async def _handle_push_action(self, request: web.Request) -> web.Response:
         """POST /api/push/action — handle a push notification action response.
 
-        When the user taps an action button (Approve/Reject/Reply) on a push
-        notification, this endpoint receives the response and injects it into
-        the appropriate chat session as a user message for the agent to process.
+        Two modes:
+        1. Clarify response (interaction_id present): resolves the pending
+           clarify interaction. If the clarify is no longer pending (already
+           resolved via web), the response is silently ignored.
+        2. Non-clarify action: injects the message as a user message into
+           the chat session (existing behaviour).
 
         Request body (JSON):
             {
-                "action_id": "approve|reject|reply",
-                "user_text": "",         // text input content (reply action)
+                "action_id": "choice_0|remote_input",
+                "user_text": "",          // text input content (remote_input)
                 "session_id": "sess-abc",
-                "message": "/approve"    // message text to inject into session
+                "interaction_id": "interact-abc",  // optional, for clarify
+                "message": "Rolling update"        // the choice text or typed text
             }
 
         Auth: JWT (standard Bearer token).
@@ -3805,12 +3927,37 @@ class WebchatAdapter(BasePlatformAdapter):
         action_id = data.get("action_id", "")
         session_id = data.get("session_id", "")
         message_text = data.get("message", "")
+        interaction_id = data.get("interaction_id", "")
 
         if not session_id:
             return self._json_response({"error": "session_id is required"}, status=400)
         if not message_text:
             return self._json_response({"error": "message is required"}, status=400)
 
+        # ── Clarify mode: resolve pending interaction ────────────────
+        if interaction_id:
+            ev = self._pending_clarify.pop(interaction_id, None)
+            if ev and not ev.is_set():
+                self._pending_clarify_values[interaction_id] = message_text
+                ev.set()
+                logger.info(
+                    "Push action resolved clarify: interaction=%s value=%s",
+                    interaction_id, message_text,
+                )
+                return self._json_response({
+                    "status": "ok",
+                    "resolved": "clarify",
+                    "interaction_id": interaction_id,
+                    "value": message_text,
+                })
+            else:
+                # Clarify already resolved or doesn't exist — silently ignore
+                return self._json_response({
+                    "status": "ignored",
+                    "reason": "no longer pending",
+                })
+
+        # ── Non-clarify mode: inject as user message ─────────────────
         user_id = payload.get("user_id", "unknown")
         username = payload.get("username", "unknown")
 
