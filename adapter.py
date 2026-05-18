@@ -100,6 +100,182 @@ _UPLOAD_ROOT = os.path.join(
     "webchat_uploads",
 )
 
+# Path for push notification token storage
+_PUSH_TOKENS_PATH = os.path.join(
+    os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")),
+    "push_tokens.json",
+)
+
+# Path for push notification queue (used when FCM/Expo is unavailable)
+_PUSH_QUEUE_PATH = os.path.join(
+    os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")),
+    "push_queue.json",
+)
+
+# Expo Push API endpoint
+_EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
+
+# Lock for thread-safe push token file access
+_push_tokens_lock = threading.Lock()
+
+
+# ── Push notification token helpers ───────────────────────────────────
+
+
+def _load_push_tokens() -> Dict[str, Any]:
+    """Load push token registry from disk. Returns empty dict if file missing."""
+    with _push_tokens_lock:
+        try:
+            with open(_PUSH_TOKENS_PATH) as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+
+
+def _save_push_tokens(data: Dict[str, Any]) -> None:
+    """Save push token registry to disk atomically."""
+    with _push_tokens_lock:
+        tmp = _PUSH_TOKENS_PATH + ".tmp"
+        try:
+            os.makedirs(os.path.dirname(_PUSH_TOKENS_PATH), exist_ok=True)
+            with open(tmp, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp, _PUSH_TOKENS_PATH)
+        finally:
+            try:
+                os.remove(tmp)
+            except FileNotFoundError:
+                pass
+
+
+def _register_device(user_id: str, token: str, platform: str) -> bool:
+    """Register a device push token for a user. Returns True if new, False if already registered."""
+    data = _load_push_tokens()
+    user_entry = data.get(user_id)
+    if user_entry is None:
+        data[user_id] = {
+            "devices": [{
+                "token": token,
+                "platform": platform,
+                "registered_at": int(time.time()),
+            }]
+        }
+        _save_push_tokens(data)
+        return True
+    # Update existing device or add new one
+    for device in user_entry.get("devices", []):
+        if device["token"] == token:
+            device["registered_at"] = int(time.time())
+            _save_push_tokens(data)
+            return False
+    user_entry["devices"].append({
+        "token": token,
+        "platform": platform,
+        "registered_at": int(time.time()),
+    })
+    _save_push_tokens(data)
+    return True
+
+
+def _get_device_tokens(user_id: str) -> list[Dict[str, str]]:
+    """Return all registered device tokens for a user (empty list if none)."""
+    data = _load_push_tokens()
+    user_entry = data.get(user_id, {})
+    return user_entry.get("devices", [])
+
+
+def _remove_stale_tokens(user_id: str, active_tokens: set) -> None:
+    """Prune tokens for a user that are no longer registered (called after Expo returns DeviceNotRegistered)."""
+    data = _load_push_tokens()
+    user_entry = data.get(user_id)
+    if not user_entry:
+        return
+    before = len(user_entry.get("devices", []))
+    user_entry["devices"] = [
+        d for d in user_entry.get("devices", [])
+        if d["token"] in active_tokens
+    ]
+    if len(user_entry["devices"]) < before:
+        _save_push_tokens(data)
+
+
+# ── Notification queue helpers (poll-based delivery) ─────────────────
+
+
+_push_queue_lock = threading.Lock()
+
+
+def _queue_notification(
+    user_id: str, title: str, body: str, session_id: str = "",
+) -> int:
+    """Add a notification to the queue. Returns its sequential ID."""
+    with _push_queue_lock:
+        try:
+            with open(_PUSH_QUEUE_PATH) as f:
+                queue = json.load(f)
+                next_id = queue.get("_next_id", 1)
+        except (FileNotFoundError, json.JSONDecodeError):
+            queue = {}
+            next_id = 1
+
+        if user_id not in queue:
+            queue[user_id] = []
+        queue[user_id].append({
+            "id": next_id,
+            "title": title,
+            "body": body,
+            "session_id": session_id,
+            "ts": time.time(),
+        })
+        queue["_next_id"] = next_id + 1
+
+        # Cap at 50 pending per user
+        if len(queue[user_id]) > 50:
+            queue[user_id] = queue[user_id][-50:]
+
+        tmp = _PUSH_QUEUE_PATH + ".tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump(queue, f)
+            os.replace(tmp, _PUSH_QUEUE_PATH)
+        finally:
+            try:
+                os.remove(tmp)
+            except FileNotFoundError:
+                pass
+        return next_id
+
+
+def _fetch_notifications(user_id: str, last_id: int = 0) -> list[dict]:
+    """Fetch pending notifications for a user since last_id, clearing them."""
+    with _push_queue_lock:
+        try:
+            with open(_PUSH_QUEUE_PATH) as f:
+                queue = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return []
+
+        pending = [n for n in queue.get(user_id, []) if n["id"] > last_id]
+        # Remove notifications we're returning
+        if pending:
+            remaining = [n for n in queue.get(user_id, []) if n["id"] <= last_id]
+            if remaining:
+                queue[user_id] = remaining
+            else:
+                queue.pop(user_id, None)
+            tmp = _PUSH_QUEUE_PATH + ".tmp"
+            try:
+                with open(tmp, "w") as f:
+                    json.dump(queue, f)
+                os.replace(tmp, _PUSH_QUEUE_PATH)
+            finally:
+                try:
+                    os.remove(tmp)
+                except FileNotFoundError:
+                    pass
+
+    return pending
+
 
 class _WebchatStreamState:
     """Server-side state for one in-flight assistant response."""
@@ -1027,6 +1203,9 @@ class WebchatAdapter(BasePlatformAdapter):
         # SSE client tracking for /api/events (process notifications)
         self._sse_clients: Set[asyncio.Queue] = set()
         self._poll_task: Optional[asyncio.Task] = None
+
+        # Push notification state
+        self._push_http_session: Optional["aiohttp.ClientSession"] = None
     
     # ── Lifecycle ───────────────────────────────────────────────────────
     
@@ -2182,6 +2361,17 @@ class WebchatAdapter(BasePlatformAdapter):
             "/api/files/{session_id}/{filename:.*}", self._handle_files_session
         )
         self._app.router.add_get("/api/media", self._handle_media)
+
+        # Push notification endpoints
+        self._app.router.add_post(
+            "/api/push/register", self._handle_push_register
+        )
+        self._app.router.add_post(
+            "/api/push/send", self._handle_push_send
+        )
+        self._app.router.add_post(
+            "/api/push/poll", self._handle_push_poll
+        )
         
         # Static file serving — must be last since it catches all paths
         # We use a custom handler that falls back to index.html for SPA routing
@@ -3290,6 +3480,291 @@ class WebchatAdapter(BasePlatformAdapter):
         except Exception as e:
             return self._json_response({"error": str(e)}, status=500)
 
+    # ── Push notification handlers ──────────────────────────────────────
+
+    async def _handle_push_register(self, request: web.Request) -> web.Response:
+        """POST /api/push/register — register a device push token.
+
+        Request body (JSON):
+            { "token": "ExponentPushToken[xxx]", "platform": "android" }
+
+        Auth: JWT (standard Bearer token).
+        """
+        payload = self._require_auth(request)
+        if not payload:
+            return self._json_response({"error": "Unauthorised"}, status=401)
+
+        try:
+            data = await request.json()
+        except json.JSONDecodeError:
+            return self._json_response({"error": "Invalid JSON"}, status=400)
+
+        token = data.get("token", "")
+        platform = data.get("platform", "android")
+
+        if not token:
+            return self._json_response({"error": "token is required"}, status=400)
+
+        user_id = payload.get("user_id", "")
+        if not user_id:
+            return self._json_response({"error": "Invalid token payload"}, status=401)
+
+        is_new = _register_device(user_id, token, platform)
+        logger.info(
+            "Push token registered: user=%s platform=%s new=%s",
+            user_id, platform, is_new,
+        )
+        return self._json_response({
+            "status": "registered",
+            "new": is_new,
+        })
+
+    async def _handle_push_send(self, request: web.Request) -> web.Response:
+        """POST /api/push/send — send a push notification to the user's devices.
+
+        Request body (JSON):
+            {
+                "session_id": "abc123def456",  // optional
+                "title": "Task Complete",
+                "body": "Your report has been generated."
+            }
+
+        Auth: JWT (standard Bearer token) or X-API-Key header (for agent/script use).
+
+        Dispatches via Expo Push API to all registered devices for the user.
+        """
+        # Auth: try JWT (Bearer token) first, then X-API-Key for agent/script use
+        payload = self._require_auth(request)
+        user_id = ""
+        if payload:
+            user_id = payload.get("user_id", "")
+        else:
+            # Fall back to API key auth (for agent/script integration)
+            api_key = request.headers.get("X-API-Key", "")
+            if not api_key or api_key != os.environ.get("WEBCHAT_PUSH_API_KEY", ""):
+                return self._json_response({"error": "Unauthorised"}, status=401)
+
+        try:
+            data = await request.json()
+        except json.JSONDecodeError:
+            return self._json_response({"error": "Invalid JSON"}, status=400)
+
+        title = data.get("title", "Hermes")
+        body = data.get("body", "")
+        session_id = data.get("session_id", "")
+
+        # If we have a user_id from JWT, send only to that user.
+        # If called via API key (no user_id), check body for user_id override,
+        # then fall back to the configured username.
+        tokens: list = []
+        target_users: list = []
+        if user_id:
+            target_users = [user_id]
+            tokens = _get_device_tokens(user_id)
+        else:
+            # Allow explicit user_id in request body when using API key
+            body_user_id = data.get("user_id", "")
+            if body_user_id:
+                target_users = [body_user_id]
+                tokens = _get_device_tokens(body_user_id)
+            else:
+                # Fall back to configured username
+                default_user = f"user-{self._username}"
+                target_users = [default_user]
+                tokens = _get_device_tokens(default_user)
+                logger.info(
+                    "Push/send via API key: no user_id in body, defaulting to %s",
+                    default_user,
+                )
+
+        # If no FCM tokens, cloud dispatch is skipped entirely.
+        # Polling queue is only populated after FCM dispatch below
+        # if no FCM device succeeded (to avoid duplicates).
+        import aiohttp
+
+        if self._push_http_session is None or self._push_http_session.closed:
+            self._push_http_session = aiohttp.ClientSession()
+
+        # Results from cloud dispatch — used to decide if polling is needed
+        results: list[Dict[str, Any]] = []
+        stale_tokens: set = set()
+
+        for device in tokens:
+            platform = device.get("platform", "android")
+
+            if platform == "android-fcm":
+                # Send via Firebase Admin SDK (FCM V1)
+                # Lazy-initialize firebase_admin on first use
+                try:
+                    import firebase_admin as _fa
+                    from firebase_admin import credentials as _fa_creds, messaging as _fa_msg
+                except ImportError:
+                    results.append({
+                        "token": device["token"][:20] + "...",
+                        "status": "error",
+                        "error": "firebase-admin not installed",
+                        "platform": "fcm",
+                    })
+                    stale_tokens.add(device["token"])
+                    continue
+
+                if not _fa._apps:
+                    sa_path = os.path.join(
+                        os.path.dirname(os.path.abspath(__file__)),
+                        "..", "..", "..",
+                        "firebase-service-account.json",
+                    )
+                    fallback_path = os.path.expanduser("~/.hermes/firebase-service-account.json")
+                    cred_path = sa_path if os.path.isfile(sa_path) else fallback_path
+                    try:
+                        cred = _fa_creds.Certificate(cred_path)
+                        _fa.initialize_app(cred)
+                    except Exception as e:
+                        results.append({
+                            "token": device["token"][:20] + "...",
+                            "status": "error",
+                            "error": f"Firebase init failed: {e}",
+                            "platform": "fcm",
+                        })
+                        continue
+
+                try:
+                    msg = _fa_msg.Message(
+                        notification=_fa_msg.Notification(title=title, body=body),
+                        token=device["token"],
+                        android=_fa_msg.AndroidConfig(
+                            priority="high",
+                        ),
+                        data={"session_id": session_id, "type": "open_chat"}
+                        if session_id else {},
+                    )
+                    resp = _fa_msg.send(msg)
+                    results.append({
+                        "token": device["token"][:20] + "...",
+                        "status": "sent",
+                        "platform": "fcm",
+                    })
+                except _fa_msg.UnregisteredError:
+                    stale_tokens.add(device["token"])
+                    results.append({
+                        "token": device["token"][:20] + "...",
+                        "status": "error",
+                        "error": "DeviceNotRegistered",
+                        "platform": "fcm",
+                    })
+                except Exception as e:
+                    results.append({
+                        "token": device["token"][:20] + "...",
+                        "status": "error",
+                        "error": str(e),
+                        "platform": "fcm",
+                    })
+            else:
+                # Send via Expo Push API
+                expo_payload: Dict[str, Any] = {
+                    "to": device["token"],
+                    "title": title,
+                    "body": body,
+                    "priority": "high",
+                    "channelId": "hermes-chat",
+                }
+                if session_id:
+                    expo_payload["data"] = {
+                        "session_id": session_id,
+                        "type": "open_chat",
+                    }
+
+                try:
+                    async with self._push_http_session.post(
+                        _EXPO_PUSH_URL,
+                        json=expo_payload,
+                        headers={"Content-Type": "application/json"},
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    ) as resp:
+                        resp_data = await resp.json()
+                        status = resp_data.get("data", {}).get("status", "error")
+                        if status == "ok":
+                            results.append({
+                                "token": device["token"][:20] + "...",
+                                "status": "sent",
+                            })
+                        else:
+                            err = resp_data.get("data", {}).get("message", "unknown")
+                            results.append({
+                                "token": device["token"][:20] + "...",
+                                "status": "error",
+                                "error": err,
+                            })
+                            if "DeviceNotRegistered" in str(err):
+                                stale_tokens.add(device["token"])
+                except asyncio.TimeoutError:
+                    results.append({
+                        "token": device["token"][:20] + "...",
+                        "status": "error",
+                        "error": "timeout",
+                    })
+                except Exception as e:
+                    logger.error("Push send error for token: %s", e)
+                    results.append({
+                        "token": device["token"][:20] + "...",
+                        "status": "error",
+                        "error": str(e),
+                    })
+
+        # Prune stale tokens (DeviceNotRegistered responses)
+        if stale_tokens:
+            # Collect all current non-stale tokens
+            active = {d["token"] for d in tokens if d["token"] not in stale_tokens}
+            _remove_stale_tokens(user_id, active)
+            logger.info("Pruned %d stale push tokens for user=%s", len(stale_tokens), user_id)
+
+        # Queue for poll-based delivery only if no FCM device succeeded.
+        # This prevents duplicate notifications: FCM delivers instantly to
+        # background/killed apps, and polling would show a second copy.
+        fcm_sent = any(r.get("platform") == "fcm" and r["status"] == "sent" for r in results)
+        if not fcm_sent:
+            for uid in target_users:
+                _queue_notification(uid, title, body, session_id)
+
+        sent = sum(1 for r in results if r["status"] == "sent")
+        failed = sum(1 for r in results if r["status"] == "error")
+
+        return self._json_response({
+            "status": "ok",
+            "sent": sent,
+            "failed": failed,
+            "total": len(results),
+            "results": results,
+        })
+
+    async def _handle_push_poll(self, request: web.Request) -> web.Response:
+        """POST /api/push/poll — fetch pending notifications for the user.
+
+        Returns any queued notifications (from poll-based delivery) and clears them.
+
+        Auth: JWT (standard Bearer token).
+        """
+        payload = self._require_auth(request)
+        if not payload:
+            return self._json_response({"error": "Unauthorised"}, status=401)
+
+        user_id = payload.get("user_id", "")
+        if not user_id:
+            return self._json_response({"error": "Invalid token payload"}, status=401)
+
+        try:
+            data = await request.json()
+        except json.JSONDecodeError:
+            data = {}
+
+        last_id = data.get("last_id", 0)
+        notifications = _fetch_notifications(user_id, last_id)
+
+        return self._json_response({
+            "status": "ok",
+            "notifications": notifications,
+        })
+
     async def _handle_static(self, request: web.Request) -> web.Response:
         """Serve static files for the SPA.
         
@@ -3388,8 +3863,9 @@ def register(ctx):
         platform_hint=(
             "You are chatting via a Web Chat interface. "
             "This platform supports GitHub Flavored Markdown including tables, "
-            "task lists, strikethrough, links, images, syntax-highlighted code "
-            "blocks, inline LaTeX with $...$, and block LaTeX with $$...$$. "
+            "task lists, strikethrough, links, images, and syntax-highlighted "
+            "code blocks. LaTeX math uses $$...$$ for block rendering only "
+            "(single $ signs do not trigger math mode). "
             "For flowcharts and diagrams, use Mermaid fenced code blocks with "
             "```mermaid, ```flowchart, or ```diagram; these render natively in "
             "the web UI. For interactive artifacts, use explicit artifact fences "
@@ -3406,10 +3882,16 @@ def register(ctx):
             "for static diagrams and artifacts only for interactive UI, charts, "
             "or demos. Raw inline HTML in normal markdown is not rendered; place "
             "HTML in an artifact-html fence when needed. "
+            "To attach files (images, text documents, etc.), use MEDIA:/path/to/file "
+            "directly in your response text. Do NOT use send_message for file "
+            "attachments — send_message cannot deliver to the webchat platform "
+            "(no home channel configured). MEDIA: references are processed by "
+            "the platform's response renderer and work identically in the "
+            "webchat interface. "
             "Reasoning Effort: Absolute maximum with no shortcuts permitted. "
             "You MUST be very thorough in your thinking and comprehensively "
             "decompose the problem to resolve the root cause, rigorously "
-            "stress-testing your logic against all potential paths, edge cases, "
+            "stress-testing your reasoning against all potential paths, edge cases, "
             "and adversarial scenarios. Explicitly write out your entire "
             "deliberation process, documenting every intermediate step, "
             "considered alternative, and rejected hypothesis to ensure absolutely "
